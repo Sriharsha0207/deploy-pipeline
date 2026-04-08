@@ -1,0 +1,140 @@
+pipeline {
+    agent any
+
+    // We only need NodeJS here. Docker is handled dynamically in the pipeline now!
+    tools {
+        nodejs 'node18' 
+    }
+
+    environment {
+        // App Variables (Update IMAGE_NAME with your DockerHub Username)
+        IMAGE_NAME   = "sriharsha0207/nodejs-app" 
+        TAG          = "${env.BUILD_NUMBER}"
+        
+        // AWS & Cluster Variables
+        AWS_REGION   = "ap-south-1"
+        CLUSTER_NAME = "my-automated-eks"
+        
+        // Safety Path for our locally installed K8s/AWS tools
+        PATH         = "${env.WORKSPACE}/local-bin:${env.PATH}"
+    }
+
+    stages {
+        stage('Clean Workspace') {
+            steps { 
+                cleanWs() 
+            }
+        }
+
+        stage('Checkout Code') {
+            steps {
+                git branch: 'main', url: 'https://github.com/Sriharsha0207/deploy-pipeline.git'
+            }
+        }
+
+        // 🌟 AUTOMATIC DOCKER INSTALLATION
+        stage('Install & Start Docker Engine') {
+            steps {
+                sh '''
+                echo "Checking Docker..."
+                if ! command -v docker &> /dev/null || ! sudo systemctl is-active --quiet docker; then
+                    echo "Installing Docker..."
+                    sudo yum update -y
+                    sudo yum install docker unzip -y  # Added unzip for the AWS CLI step
+                    
+                    sudo systemctl start docker
+                    sudo systemctl enable docker
+                    
+                    # Grant immediate pipeline access to the Docker socket
+                    sudo chmod 666 /var/run/docker.sock
+                else
+                    echo "Docker is already running."
+                    sudo chmod 666 /var/run/docker.sock || true
+                fi
+                '''
+            }
+        }
+
+        // 🌟 AUTOMATIC KUBERNETES & AWS CLI INSTALLATION
+        stage('Install Kubernetes & AWS Tools') {
+            steps {
+                sh '''
+                mkdir -p ${WORKSPACE}/local-bin
+                
+                if ! command -v kubectl &> /dev/null; then
+                    echo "Installing kubectl..."
+                    curl -sLO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+                    chmod +x kubectl
+                    mv kubectl ${WORKSPACE}/local-bin/
+                fi
+                
+                if ! command -v aws &> /dev/null; then
+                    echo "Installing AWS CLI..."
+                    curl -s "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+                    unzip -q awscliv2.zip
+                    sudo ./aws/install -i /usr/local/aws-cli -b /usr/local/bin --update
+                fi
+                
+                if ! command -v eksctl &> /dev/null; then
+                    echo "Installing eksctl..."
+                    curl --silent --location "https://github.com/weaveworks/eksctl/releases/latest/download/eksctl_Linux_amd64.tar.gz" | tar xz -C ${WORKSPACE}/local-bin
+                fi
+                '''
+            }
+        }
+
+        stage('Docker Build & Push') {
+            steps {
+                script {
+                    withDockerRegistry(credentialsId: 'docker-creds', toolName: '') {
+                        sh """
+                        docker build -t $IMAGE_NAME:$TAG .
+                        docker push $IMAGE_NAME:$TAG
+                        """
+                    }
+                }
+            }
+        }
+
+        // 🌟 AUTOMATIC CLUSTER PROVISIONING
+        stage('Provision EKS Cluster') {
+            steps {
+                script {
+                    sh """
+                    echo "Checking if EKS cluster '${CLUSTER_NAME}' exists..."
+                    
+                    if ! eksctl get cluster --name ${CLUSTER_NAME} --region ${AWS_REGION} &> /dev/null; then
+                        echo "Creating new EKS cluster (This takes ~15 minutes)..."
+                        eksctl create cluster \\
+                            --name ${CLUSTER_NAME} \\
+                            --region ${AWS_REGION} \\
+                            --nodegroup-name standard-workers \\
+                            --node-type t3.medium \\
+                            --nodes 2 \\
+                            --nodes-min 1 \\
+                            --nodes-max 3 \\
+                            --managed
+                    else
+                        echo "Cluster '${CLUSTER_NAME}' already exists. Skipping creation."
+                    fi
+                    """
+                }
+            }
+        }
+
+        stage('Deploy to EKS') {
+            steps {
+                script {
+                    // Tell kubectl to talk to your EKS cluster
+                    sh "aws eks update-kubeconfig --region ${AWS_REGION} --name ${CLUSTER_NAME}"
+
+                    // Swap IMAGE_PLACEHOLDER in your YAML with the newly built Docker image
+                    sh "sed -i 's|IMAGE_PLACEHOLDER|${IMAGE_NAME}:${TAG}|g' nodejsapp.yaml"
+
+                    // Deploy it!
+                    sh 'kubectl apply -f nodejsapp.yaml'
+                }
+            }
+        }
+    }
+}
